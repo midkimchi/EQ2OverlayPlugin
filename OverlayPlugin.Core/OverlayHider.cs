@@ -1,4 +1,4 @@
-﻿using System;
+using System;
 using System.Collections.Generic;
 using System.Diagnostics;
 using System.IO;
@@ -6,13 +6,22 @@ using System.Linq;
 using System.Text;
 using System.Threading.Tasks;
 using System.Windows.Forms;
+using Advanced_Combat_Tracker; // Added for EQ2 native ACT combat events
 using RainbowMage.OverlayPlugin.MemoryProcessors.InCombat;
 using RainbowMage.OverlayPlugin.NetworkProcessors;
 using static RainbowMage.OverlayPlugin.MemoryProcessors.InCombat.LineInCombat;
 
 namespace RainbowMage.OverlayPlugin
 {
-    class OverlayHider : IDisposable
+    public interface IOverlayHider : IDisposable
+    {
+        void UpdateOverlays();
+    }
+
+    // ==========================================
+    // ORIGINAL FFXIV HIDER
+    // ==========================================
+    class FFXIVOverlayHider : IOverlayHider
     {
         private bool gameActive = true;
         private bool inCutscene = false;
@@ -29,7 +38,7 @@ namespace RainbowMage.OverlayPlugin
         private Timer focusTimer;
         private bool _disposed;
 
-        public OverlayHider(TinyIoCContainer container)
+        public FFXIVOverlayHider(TinyIoCContainer container)
         {
             this.config = container.Resolve<IPluginConfig>();
             this.logger = container.Resolve<ILogger>();
@@ -122,8 +131,7 @@ namespace RainbowMage.OverlayPlugin
                 }
                 catch (System.ComponentModel.Win32Exception ex)
                 {
-                    // Ignore access denied errors. Those usually happen if the foreground window is running with
-                    // admin permissions but we are not.
+                    // Ignore access denied errors
                     if (ex.ErrorCode == -2147467259)  // 0x80004005
                     {
                         gameActive = false;
@@ -166,6 +174,145 @@ namespace RainbowMage.OverlayPlugin
             {
                 if (disposing)
                 {
+                    focusTimer?.Stop();
+                    focusTimer?.Dispose();
+                    focusTimer = null;
+                }
+                _disposed = true;
+            }
+        }
+
+        public void Dispose()
+        {
+            Dispose(disposing: true);
+            GC.SuppressFinalize(this);
+        }
+    }
+
+    // ==========================================
+    // EQ2 HIDER
+    // ==========================================
+    class EQ2OverlayHider : IOverlayHider
+    {
+        private bool gameActive = true;
+        private bool inCombat = false;
+        private IPluginConfig config;
+        private ILogger logger;
+        [System.Diagnostics.CodeAnalysis.SuppressMessage(
+            "Usage",
+            "CA2213:Disposable fields should be disposed",
+            Justification = "main is disposed of by TinyIoCContainer")]
+        private PluginMain main;
+        private Timer focusTimer;
+        private bool _disposed;
+
+        public EQ2OverlayHider(TinyIoCContainer container)
+        {
+            this.config = container.Resolve<IPluginConfig>();
+            this.logger = container.Resolve<ILogger>();
+            this.main = container.Resolve<PluginMain>();
+
+            container.Resolve<NativeMethods>().ActiveWindowChanged += ActiveWindowChangedHandler;
+
+            // Bind to ACT's native combat events for EQ2 combat tracking
+            if (ActGlobals.oFormActMain != null)
+            {
+                ActGlobals.oFormActMain.OnCombatStart += Act_OnCombatStart;
+                ActGlobals.oFormActMain.OnCombatEnd += Act_OnCombatEnd;
+            }
+
+            focusTimer = new Timer();
+            focusTimer.Tick += (o, e) => ActiveWindowChangedHandler(this, IntPtr.Zero);
+            focusTimer.Interval = 10000;  // 10 seconds
+            focusTimer.Start();
+        }
+
+        public void UpdateOverlays()
+        {
+            if (!config.HideOverlaysWhenNotActive)
+                gameActive = true;
+
+            try
+            {
+                foreach (var overlay in main.Overlays)
+                {
+                    if (overlay.Config.IsVisible)
+                    {
+                        overlay.Visible = gameActive && (!overlay.Config.HideOutOfCombat || inCombat);
+                    }
+                }
+            }
+            catch (Exception ex)
+            {
+                logger.Log(LogLevel.Error, $"EQ2OverlayHider: Failed to update overlays: {ex}");
+            }
+        }
+
+        private void ActiveWindowChangedHandler(object sender, IntPtr changedWindow)
+        {
+            if (!config.HideOverlaysWhenNotActive) return;
+            try
+            {
+                try
+                {
+                    NativeMethods.GetWindowThreadProcessId(NativeMethods.GetForegroundWindow(), out uint pid);
+
+                    if (pid == 0)
+                        return;
+
+                    var exePath = Process.GetProcessById((int)pid).MainModule.FileName;
+                    var fileName = Path.GetFileName(exePath.ToString());
+                    
+                    // Check if the focused window is EverQuest 2 or ACT itself
+                    gameActive = (fileName.Equals("EverQuest2.exe", StringComparison.OrdinalIgnoreCase) ||
+                                  exePath.ToString() == Process.GetCurrentProcess().MainModule.FileName);
+                }
+                catch (System.ComponentModel.Win32Exception ex)
+                {
+                    // Ignore access denied errors
+                    if (ex.ErrorCode == -2147467259)  // 0x80004005
+                    {
+                        gameActive = false;
+                    }
+                    else
+                    {
+                        logger.Log(LogLevel.Error, "EQ2WindowWatcher: {0}", ex.ToString());
+                    }
+                }
+            }
+            catch (Exception ex)
+            {
+                logger.Log(LogLevel.Error, "EQ2WindowWatcher: {0}", ex.ToString());
+            }
+
+            UpdateOverlays();
+        }
+
+        private void Act_OnCombatStart(bool isImport, CombatToggleEventArgs encounterInfo)
+        {
+            inCombat = true;
+            UpdateOverlays();
+        }
+
+        private void Act_OnCombatEnd(bool isImport, CombatToggleEventArgs encounterInfo)
+        {
+            inCombat = false;
+            UpdateOverlays();
+        }
+
+        protected virtual void Dispose(bool disposing)
+        {
+            if (!_disposed)
+            {
+                if (disposing)
+                {
+                    // Clean up ACT event listeners to prevent memory leaks
+                    if (ActGlobals.oFormActMain != null)
+                    {
+                        ActGlobals.oFormActMain.OnCombatStart -= Act_OnCombatStart;
+                        ActGlobals.oFormActMain.OnCombatEnd -= Act_OnCombatEnd;
+                    }
+
                     focusTimer?.Stop();
                     focusTimer?.Dispose();
                     focusTimer = null;
